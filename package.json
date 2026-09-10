@@ -1,0 +1,12 @@
+{
+  "name": "vorlen-mexc-private-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node worker.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

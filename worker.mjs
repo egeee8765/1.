@@ -60,18 +60,25 @@ function connect() {
   ws.on('message', raw => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
-    if (msg.channel === 'rs.login' && msg.data?.success === true) {
-      loggedIn = true;
-      console.log(JSON.stringify({ event: 'authenticated', at: new Date().toISOString() }));
-      ws.send(filterMessage());
+
+    if (msg.channel === 'rs.login') {
+      if (msg.data === 'success') {
+        loggedIn = true;
+        console.log(JSON.stringify({ event: 'authenticated', at: new Date().toISOString() }));
+        ws.send(filterMessage());
+      } else {
+        console.error(JSON.stringify({ event: 'authentication_failed', channel: msg.channel, dataType: typeof msg.data, data: msg.data }));
+        closedByUs = true;
+        ws.close();
+      }
       return;
     }
-    if (msg.channel === 'rs.login' && msg.data?.success !== true) {
-      console.error(JSON.stringify({ event: 'authentication_failed', data: msg.data }));
-      closedByUs = true;
-      ws.close();
+
+    if (msg.channel === 'rs.error') {
+      console.error(JSON.stringify({ event: 'authentication_or_protocol_error', data: msg.data }));
       return;
     }
+
     if (msg.channel === 'push.personal.order' || msg.channel === 'push.personal.order.deal' || msg.channel === 'push.personal.position') {
       console.log(JSON.stringify({ event: 'private_event', channel: msg.channel, data: msg.data, at: new Date().toISOString() }));
     }

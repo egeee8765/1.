@@ -25,6 +25,7 @@ http.createServer((req, res) => {
   if (req.url?.startsWith('/events')) {
     const auth = req.headers.authorization || '';
     if (auth !== `Bearer ${API_SECRET}`) {
+      console.warn(JSON.stringify({ event: 'events_poll_unauthorized', at: new Date().toISOString() }));
       res.writeHead(401, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
       return;
@@ -32,6 +33,7 @@ http.createServer((req, res) => {
     const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const after = Number(u.searchParams.get('after') || 0);
     const events = queue.filter(x => x.id > after);
+    console.log(JSON.stringify({ event: 'events_poll', after, returned: events.length, cursor: sequence, queueSize: queue.length, at: new Date().toISOString() }));
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     res.end(JSON.stringify({ ok: true, cursor: sequence, events }));
     return;

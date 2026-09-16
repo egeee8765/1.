@@ -1,13 +1,12 @@
 {
-  "name": "vorlen-mexc-private-worker",
+  "name": "aurevix-signal-bot",
   "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node worker-durable.mjs"
+    "start": "node signal-bot.mjs"
   },
   "dependencies": {
-    "pg": "^8.16.3",
     "ws": "^8.18.0"
   }
 }

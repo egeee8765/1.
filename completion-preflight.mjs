@@ -22,9 +22,9 @@ async function fetchHistorical(symbol='BTC_USDT',interval='Hour4',count=400){
 async function main(){
   audit('completion_preflight_start');
   const deterministic=runCompletionValidation(Date.now());
-  audit('completion_validation_suite',{type:deterministic.type,result:deterministic.allPass?'PASS':'FAIL',count:deterministic.count,passed:deterministic.passed,failed:deterministic.failed});
+  audit('completion_validation_suite',{type:deterministic.type,result:deterministic.allPass?'PASS':'FAIL',count:deterministic.count,passed:deterministic.passed,failed:deterministic.failed,failedTests:deterministic.results.filter(x=>x.result==='FAIL').map(x=>({name:x.name,error:x.error}))});
   const full=await runFullCompletionValidation({now:Date.now(),root:`${root}/completion-preflight`,fetchKlines:fetchHistorical});
-  audit('full_completion_validation_suite',{type:full.type,result:full.allPass?'PASS':'FAIL',count:full.count,passed:full.passed,failed:full.failed,realOrders:0,realPositionModifications:0});
+  audit('full_completion_validation_suite',{type:full.type,result:full.allPass?'PASS':'FAIL',count:full.count,passed:full.passed,failed:full.failed,failedTests:full.results.filter(x=>x.result==='FAIL').map(x=>({name:x.name,error:x.error})),historicalTests:full.results.filter(x=>/historical|oos|walk-forward|monte-carlo/.test(x.name)).map(x=>({name:x.name,result:x.result,evidence:x.evidence,error:x.error})),realOrders:0,realPositionModifications:0});
   if(!deterministic.allPass||!full.allPass){audit('completion_preflight_blocked',{reason:'CRITICAL_COMPLETION_VALIDATION_FAILED'});process.exitCode=1;return;}
   audit('completion_preflight_pass',{historicalDataset:'MEXC_PUBLIC_READ_ONLY',execution:'PAPER_ONLY'});
   await import('./worker-completion.mjs');

@@ -11,7 +11,8 @@ const API_KEY = process.env.MEXC_API_KEY;
 const API_SECRET = process.env.MEXC_API_SECRET;
 const PORT = Number(process.env.PORT || 10000);
 const STATE_FILE = process.env.RUNTIME_STATE_FILE || '/tmp/aurevix-runtime-state.json';
-const LEASE_FILE = process.env.RUNTIME_LEASE_FILE || '/tmp/aurevix-runtime-lease.json';
+const LEASE_DIR = process.env.RUNTIME_LEASE_DIR || '/tmp/aurevix-runtime-lease';
+const LEASE_OWNER_FILE = path.join(LEASE_DIR, 'owner.json');
 const LEASE_MS = 90000;
 const HEARTBEAT_MS = 15000;
 const RECONNECT_MS = 5000;
@@ -36,7 +37,9 @@ function loadState() {
 function persist() {
   const next = { ...state, runtimeId, updatedAt: new Date().toISOString(), liveEnabled: LIVE_ENABLED, ordersSent: 0, positionsModified: 0 };
   fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-  fs.writeFileSync(STATE_FILE, JSON.stringify(next));
+  const temp = `${STATE_FILE}.${runtimeId}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(next));
+  fs.renameSync(temp, STATE_FILE);
   state = next;
 }
 function audit(event, extra = {}) {
@@ -46,30 +49,35 @@ function audit(event, extra = {}) {
 function acquireLease() {
   const now = Date.now();
   try {
-    if (fs.existsSync(LEASE_FILE)) {
-      const old = JSON.parse(fs.readFileSync(LEASE_FILE, 'utf8'));
-      if (old.expiresAt > now && old.runtimeId !== runtimeId) {
-        leaseHeld = false;
-        audit('execution_authority_blocked', { ownerRuntimeId: old.runtimeId });
-        return false;
-      }
-    }
+    fs.mkdirSync(LEASE_DIR);
     const record = { key: 'EXECUTION_AUTHORITY', runtimeId, expiresAt: now + LEASE_MS, updatedAt: new Date(now).toISOString() };
-    fs.writeFileSync(LEASE_FILE, JSON.stringify(record), { flag: 'w' });
-    const verify = JSON.parse(fs.readFileSync(LEASE_FILE, 'utf8'));
-    leaseHeld = verify.runtimeId === runtimeId;
-    if (!leaseHeld) audit('execution_authority_unknown');
-    return leaseHeld;
+    fs.writeFileSync(LEASE_OWNER_FILE, JSON.stringify(record), { flag: 'wx' });
+    leaseHeld = true;
+    audit('execution_authority_acquired', { expiresAt: record.expiresAt });
+    return true;
   } catch (e) {
+    try {
+      const old = JSON.parse(fs.readFileSync(LEASE_OWNER_FILE, 'utf8'));
+      if (old.runtimeId === runtimeId && old.expiresAt > now) {
+        leaseHeld = true;
+        return true;
+      }
+      if (old.expiresAt <= now) {
+        audit('execution_authority_expired_owner', { ownerRuntimeId: old.runtimeId });
+      } else {
+        audit('execution_authority_blocked', { ownerRuntimeId: old.runtimeId, expiresAt: old.expiresAt });
+      }
+    } catch (readError) {
+      audit('execution_authority_error', { message: readError instanceof Error ? readError.message : 'unknown' });
+    }
     leaseHeld = false;
-    audit('execution_authority_error', { message: e instanceof Error ? e.message : 'unknown' });
     return false;
   }
 }
 function renewLease() {
   if (!leaseHeld) return acquireLease();
   try {
-    const current = JSON.parse(fs.readFileSync(LEASE_FILE, 'utf8'));
+    const current = JSON.parse(fs.readFileSync(LEASE_OWNER_FILE, 'utf8'));
     if (current.runtimeId !== runtimeId || current.expiresAt <= Date.now()) {
       leaseHeld = false;
       audit('execution_authority_lost', { ownerRuntimeId: current.runtimeId });
@@ -77,7 +85,9 @@ function renewLease() {
     }
     current.expiresAt = Date.now() + LEASE_MS;
     current.updatedAt = new Date().toISOString();
-    fs.writeFileSync(LEASE_FILE, JSON.stringify(current), { flag: 'w' });
+    const temp = `${LEASE_OWNER_FILE}.${runtimeId}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(current));
+    fs.renameSync(temp, LEASE_OWNER_FILE);
     return true;
   } catch (e) {
     leaseHeld = false;
@@ -87,9 +97,10 @@ function renewLease() {
 }
 function releaseLease() {
   try {
-    if (fs.existsSync(LEASE_FILE)) {
-      const current = JSON.parse(fs.readFileSync(LEASE_FILE, 'utf8'));
-      if (current.runtimeId === runtimeId) fs.unlinkSync(LEASE_FILE);
+    const current = JSON.parse(fs.readFileSync(LEASE_OWNER_FILE, 'utf8'));
+    if (current.runtimeId === runtimeId) {
+      fs.unlinkSync(LEASE_OWNER_FILE);
+      fs.rmdirSync(LEASE_DIR);
     }
   } catch {}
   leaseHeld = false;
@@ -154,7 +165,6 @@ function engineCycle() {
     persist();
     return;
   }
-  // Deliberately execution-inert while LIVE is OFF: no order creation and no position mutation.
   state = { ...state, state: LIVE_ENABLED ? 'WAITING_FOR_APP_ENGINE_AUTHORITY' : 'PAPER_RUNTIME', lastError: null, sequence: (state.sequence || 0) + 1 };
   persist();
 }
@@ -179,7 +189,12 @@ async function main() {
     process.exitCode = 1;
     return;
   }
-  acquireLease();
+  if (!acquireLease()) {
+    state = { ...state, state: 'SAFE_STATE', lastError: 'EXECUTION_AUTHORITY_UNKNOWN' };
+    persist();
+    audit('runtime_start_blocked', { reason: 'Another runtime owns the local atomic lease' });
+    return;
+  }
   persist();
   audit('runtime_started', { leaseHeld, mode: LIVE_ENABLED ? 'LIVE_LOCKED_PENDING_AUTHORITY' : 'LIVE_OFF' });
   connect();

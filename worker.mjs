@@ -1,125 +1,207 @@
 import WebSocket from 'ws';
 import crypto from 'node:crypto';
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
 import { URL } from 'node:url';
 
+const SERVICE = 'aurevix-elite-independent-runtime';
 const WS_URL = 'wss://contract.mexc.com/edge';
 const API_KEY = process.env.MEXC_API_KEY;
 const API_SECRET = process.env.MEXC_API_SECRET;
-const RECONNECT_MS = 5000;
 const PORT = Number(process.env.PORT || 10000);
-const queue = [];
-let sequence = 0;
+const STATE_FILE = process.env.RUNTIME_STATE_FILE || '/tmp/aurevix-runtime-state.json';
+const LEASE_FILE = process.env.RUNTIME_LEASE_FILE || '/tmp/aurevix-runtime-lease.json';
+const LEASE_MS = 90000;
+const HEARTBEAT_MS = 15000;
+const RECONNECT_MS = 5000;
+const ENGINE_CYCLE_MS = 5000;
+const LIVE_ENABLED = String(process.env.AUREVIX_LIVE_TRADING || '').trim().toUpperCase() === 'ENABLED';
+const runtimeId = `runtime-${crypto.randomUUID()}`;
+let state = loadState();
+let lastMexcEventAt = null;
+let lastMexcCallAt = null;
+let lastError = null;
+let connected = false;
+let authenticated = false;
+let ws = null;
+let closedByUs = false;
+let stopping = false;
+let leaseHeld = false;
 
-function enqueue(event) {
-  queue.push({ id: ++sequence, ...event });
-  if (queue.length > 500) queue.shift();
+function loadState() {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
+  catch { return { service: SERVICE, state: 'STARTING', sequence: 0, ordersSent: 0, positionsModified: 0 }; }
 }
-
-http.createServer((req, res) => {
-  if (req.url === '/' || req.url === '/health') {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ service: 'vorlen-mexc-private-worker', status: 'ok', queueSize: queue.length, cursor: sequence }));
-    return;
-  }
-  if (req.url?.startsWith('/events')) {
-    const auth = req.headers.authorization || '';
-    if (auth !== `Bearer ${API_SECRET}`) {
-      console.warn(JSON.stringify({ event: 'events_poll_unauthorized', at: new Date().toISOString() }));
-      res.writeHead(401, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
-      return;
+function persist() {
+  const next = { ...state, runtimeId, updatedAt: new Date().toISOString(), liveEnabled: LIVE_ENABLED, ordersSent: 0, positionsModified: 0 };
+  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+  fs.writeFileSync(STATE_FILE, JSON.stringify(next));
+  state = next;
+}
+function audit(event, extra = {}) {
+  const safe = { event, service: SERVICE, runtimeId, at: new Date().toISOString(), liveEnabled: LIVE_ENABLED, ordersSent: 0, positionsModified: 0, ...extra };
+  console.log(JSON.stringify(safe));
+}
+function acquireLease() {
+  const now = Date.now();
+  try {
+    if (fs.existsSync(LEASE_FILE)) {
+      const old = JSON.parse(fs.readFileSync(LEASE_FILE, 'utf8'));
+      if (old.expiresAt > now && old.runtimeId !== runtimeId) {
+        leaseHeld = false;
+        audit('execution_authority_blocked', { ownerRuntimeId: old.runtimeId });
+        return false;
+      }
     }
-    const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-    const after = Number(u.searchParams.get('after') || 0);
-    const events = queue.filter(x => x.id > after);
-    console.log(JSON.stringify({ event: 'events_poll', after, returned: events.length, cursor: sequence, queueSize: queue.length, at: new Date().toISOString() }));
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-    res.end(JSON.stringify({ ok: true, cursor: sequence, events }));
-    return;
+    const record = { key: 'EXECUTION_AUTHORITY', runtimeId, expiresAt: now + LEASE_MS, updatedAt: new Date(now).toISOString() };
+    fs.writeFileSync(LEASE_FILE, JSON.stringify(record), { flag: 'w' });
+    const verify = JSON.parse(fs.readFileSync(LEASE_FILE, 'utf8'));
+    leaseHeld = verify.runtimeId === runtimeId;
+    if (!leaseHeld) audit('execution_authority_unknown');
+    return leaseHeld;
+  } catch (e) {
+    leaseHeld = false;
+    audit('execution_authority_error', { message: e instanceof Error ? e.message : 'unknown' });
+    return false;
   }
-  res.writeHead(404);
-  res.end();
-}).listen(PORT, '0.0.0.0', () => {
-  console.log(JSON.stringify({ event: 'health_server_ready', port: PORT, at: new Date().toISOString() }));
-});
-
-if (!API_KEY || !API_SECRET) {
-  console.error('MEXC_API_KEY and MEXC_API_SECRET are required');
-  process.exit(1);
 }
-
+function renewLease() {
+  if (!leaseHeld) return acquireLease();
+  try {
+    const current = JSON.parse(fs.readFileSync(LEASE_FILE, 'utf8'));
+    if (current.runtimeId !== runtimeId || current.expiresAt <= Date.now()) {
+      leaseHeld = false;
+      audit('execution_authority_lost', { ownerRuntimeId: current.runtimeId });
+      return false;
+    }
+    current.expiresAt = Date.now() + LEASE_MS;
+    current.updatedAt = new Date().toISOString();
+    fs.writeFileSync(LEASE_FILE, JSON.stringify(current), { flag: 'w' });
+    return true;
+  } catch (e) {
+    leaseHeld = false;
+    audit('execution_authority_renewal_failed', { message: e instanceof Error ? e.message : 'unknown' });
+    return false;
+  }
+}
+function releaseLease() {
+  try {
+    if (fs.existsSync(LEASE_FILE)) {
+      const current = JSON.parse(fs.readFileSync(LEASE_FILE, 'utf8'));
+      if (current.runtimeId === runtimeId) fs.unlinkSync(LEASE_FILE);
+    }
+  } catch {}
+  leaseHeld = false;
+}
 function signature(apiKey, reqTime, secret) {
   return crypto.createHmac('sha256', secret).update(`${apiKey}${reqTime}`).digest('hex');
 }
-
 function loginMessage() {
   const reqTime = Date.now().toString();
-  return JSON.stringify({
-    method: 'login', subscribe: false,
-    param: { apiKey: API_KEY, reqTime, signature: signature(API_KEY, reqTime, API_SECRET) }
-  });
+  return JSON.stringify({ method: 'login', subscribe: false, param: { apiKey: API_KEY, reqTime, signature: signature(API_KEY, reqTime, API_SECRET) } });
 }
-
 function filterMessage() {
-  return JSON.stringify({ method: 'personal.filter', param: { filters: [
-    { filter: 'order' }, { filter: 'order.deal' }, { filter: 'position' }
-  ] } });
+  return JSON.stringify({ method: 'personal.filter', param: { filters: [{ filter: 'order' }, { filter: 'order.deal' }, { filter: 'position' }] } });
 }
-
 function connect() {
-  const ws = new WebSocket(WS_URL);
-  let loggedIn = false;
+  if (stopping) return;
+  ws = new WebSocket(WS_URL);
+  connected = false;
+  authenticated = false;
   let pingTimer;
-  let closedByUs = false;
-
+  closedByUs = false;
   ws.on('open', () => {
-    console.log(JSON.stringify({ event: 'connected', at: new Date().toISOString() }));
+    connected = true;
+    audit('mexc_connected');
     ws.send(loginMessage());
     pingTimer = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ method: 'ping' }));
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ method: 'ping' }));
     }, 10000);
   });
-
   ws.on('message', raw => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
-
+    lastMexcEventAt = Date.now();
     if (msg.channel === 'rs.login') {
-      if (msg.data === 'success') {
-        loggedIn = true;
-        enqueue({ channel: 'worker.status', data: { status: 'AUTHENTICATED' }, ts: Date.now() });
-        console.log(JSON.stringify({ event: 'authenticated', at: new Date().toISOString() }));
-        ws.send(filterMessage());
-      } else {
-        console.error(JSON.stringify({ event: 'authentication_failed', channel: msg.channel, dataType: typeof msg.data }));
-        enqueue({ channel: 'worker.status', data: { status: 'AUTHENTICATION_FAILED' }, ts: Date.now() });
-        closedByUs = true;
-        ws.close();
-      }
+      authenticated = msg.data === 'success';
+      audit(authenticated ? 'mexc_authenticated' : 'mexc_authentication_failed', { dataType: typeof msg.data });
+      if (authenticated) ws.send(filterMessage()); else { closedByUs = true; ws.close(); }
       return;
     }
-
-    if (msg.channel === 'rs.error') {
-      console.error(JSON.stringify({ event: 'authentication_or_protocol_error', data: msg.data }));
-      enqueue({ channel: 'worker.status', data: { status: 'PROTOCOL_ERROR', detail: msg.data }, ts: Date.now() });
-      return;
-    }
-
-    if (msg.channel === 'push.personal.order' || msg.channel === 'push.personal.order.deal' || msg.channel === 'push.personal.position') {
-      const event = { channel: msg.channel, data: msg.data, ts: msg.ts || Date.now() };
-      enqueue(event);
-      console.log(JSON.stringify({ event: 'private_event', channel: msg.channel, at: new Date().toISOString() }));
-    }
+    if (msg.channel === 'rs.error') audit('mexc_protocol_error', { dataType: typeof msg.data });
+    if (msg.channel?.startsWith('push.personal.')) audit('mexc_private_event', { channel: msg.channel });
   });
-
-  ws.on('error', err => console.error(JSON.stringify({ event: 'ws_error', message: err.message })));
+  ws.on('error', err => { lastError = err.message; audit('websocket_error', { message: err.message }); });
   ws.on('close', (code, reason) => {
     clearInterval(pingTimer);
-    console.error(JSON.stringify({ event: 'disconnected', code, reason: reason?.toString() || '', authenticated: loggedIn, reconnectInMs: RECONNECT_MS }));
-    enqueue({ channel: 'worker.status', data: { status: 'DISCONNECTED', code, authenticated: loggedIn }, ts: Date.now() });
-    if (!closedByUs) setTimeout(connect, RECONNECT_MS);
+    connected = false;
+    authenticated = false;
+    audit('mexc_disconnected', { code, reason: reason?.toString() || '', reconnectInMs: RECONNECT_MS });
+    if (!closedByUs && !stopping) setTimeout(connect, RECONNECT_MS);
   });
 }
+function engineCycle() {
+  const lease = renewLease();
+  lastMexcCallAt = Date.now();
+  if (!lease) {
+    state = { ...state, state: 'SAFE_STATE', lastError: 'EXECUTION_AUTHORITY_UNKNOWN' };
+    persist();
+    return;
+  }
+  if (!authenticated) {
+    state = { ...state, state: 'RECOVERING', lastError: connected ? 'MEXC_AUTH_PENDING' : 'MEXC_DISCONNECTED' };
+    persist();
+    return;
+  }
+  // Deliberately execution-inert while LIVE is OFF: no order creation and no position mutation.
+  state = { ...state, state: LIVE_ENABLED ? 'WAITING_FOR_APP_ENGINE_AUTHORITY' : 'PAPER_RUNTIME', lastError: null, sequence: (state.sequence || 0) + 1 };
+  persist();
+}
+function status() {
+  return { service: SERVICE, runtimeId, state: state.state, connected, authenticated, leaseHeld, liveEnabled: LIVE_ENABLED, ordersSent: 0, positionsModified: 0, lastMexcEventAt, lastMexcCallAt, lastError, updatedAt: state.updatedAt || null };
+}
+const server = http.createServer((req, res) => {
+  const u = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  if (u.pathname === '/' || u.pathname === '/health') {
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(JSON.stringify(status()));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ error: 'NOT_FOUND' }));
+});
+server.listen(PORT, '0.0.0.0', () => audit('health_server_ready', { port: PORT }));
 
-connect();
+async function main() {
+  if (!API_KEY || !API_SECRET) {
+    audit('startup_blocked', { reason: 'MEXC credentials are not configured' });
+    process.exitCode = 1;
+    return;
+  }
+  acquireLease();
+  persist();
+  audit('runtime_started', { leaseHeld, mode: LIVE_ENABLED ? 'LIVE_LOCKED_PENDING_AUTHORITY' : 'LIVE_OFF' });
+  connect();
+  const timer = setInterval(engineCycle, ENGINE_CYCLE_MS);
+  const heartbeat = setInterval(() => { persist(); audit('heartbeat', { state: status().state, authenticated }); }, HEARTBEAT_MS);
+  const shutdown = signal => {
+    if (stopping) return;
+    stopping = true;
+    clearInterval(timer);
+    clearInterval(heartbeat);
+    closedByUs = true;
+    try { ws?.close(); } catch {}
+    releaseLease();
+    state = { ...state, state: 'STOPPED' };
+    persist();
+    audit('graceful_shutdown', { signal });
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('uncaughtException', err => { lastError = err.message; audit('uncaught_exception', { message: err.message }); process.exit(1); });
+  process.on('unhandledRejection', err => { lastError = err instanceof Error ? err.message : 'unhandled rejection'; audit('unhandled_rejection', { message: lastError }); process.exit(1); });
+}
+main();

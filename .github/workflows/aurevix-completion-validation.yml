@@ -1,0 +1,24 @@
+name: AUREVIX Completion Validation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  completion-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm install
+      - name: Run deterministic completion validation
+        run: node --input-type=module -e "import {runCompletionValidation,backupRestoreRoundTrip} from './completion-validation.mjs'; import fs from 'node:fs'; const root='/tmp/aurevix-completion'; fs.mkdirSync(root,{recursive:true}); const r=runCompletionValidation(Date.now()); const b=backupRestoreRoundTrip(root); console.log(JSON.stringify({suite:r,backupRestore:b},null,2)); if(!r.allPass) process.exit(1);"
+      - name: Verify LIVE remains disabled in source
+        run: node --input-type=module -e "import fs from 'node:fs'; const s=fs.readFileSync('worker-production.mjs','utf8'); if(s.includes('ordersSent:1')||s.includes('positionsModified:1')) process.exit(1); console.log('LIVE source safety scan PASS');"

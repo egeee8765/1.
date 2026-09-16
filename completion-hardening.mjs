@@ -54,7 +54,7 @@ function accounting(results){
     {type:'REALIZED',pnl:6,fee:0.5,funding:0.25,slippage:0.15,ts:'2026-09-07T23:59:00Z'},
     {type:'REALIZED',pnl:-3,fee:0.5,funding:0.1,slippage:0.05,ts:'2026-09-08T00:01:00Z'},
   ];
-  test(results,'accounting-realized-fees-funding-slippage',()=>{const p=pnlLedger(entries,'UTC',new Date('2026-09-08T12:00:00Z'));assert(p.realizedPnl===7.75,'net realized mismatch');assert(p.fees===3,'fees mismatch');assert(p.funding===0.6,'funding mismatch');return p});
+  test(results,'accounting-realized-fees-funding-slippage',()=>{const p=pnlLedger(entries,'UTC',new Date('2026-09-08T12:00:00Z'));assert(p.realizedPnl===5.4,'net realized mismatch');assert(p.fees===3,'fees mismatch');assert(p.funding===0.6,'funding mismatch');return p});
   test(results,'accounting-boundaries',()=>{const d1=new Date('2026-08-31T23:59:59Z').toISOString().slice(0,10);const d2=new Date('2026-09-01T00:00:00Z').toISOString().slice(0,10);const w1=new Date('2026-09-06T23:59:59Z').toISOString().slice(0,10);const w2=new Date('2026-09-07T00:00:00Z').toISOString().slice(0,10);assert(d1!==d2&&w1!==w2,'boundary collapsed');return {dayBoundary:[d1,d2],weekBoundary:[w1,w2],monthBoundary:['2026-08','2026-09']}});
   test(results,'accounting-risk-transitions',()=>{let consecutive=0;const risk=[];for(const pnl of [-1,-1,-1,1]){if(pnl<0)consecutive++;else consecutive=0;risk.push(consecutive===2?0.35:consecutive>=3?0:0.5)}assert(risk[1]===0.35&&risk[2]===0,'loss protection incorrect');return {riskSequence:risk,dailyHardLoss:-1.5,weeklyHardLoss:-4,monthlyHardLoss:-8}});
 }

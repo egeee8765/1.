@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node worker-production.mjs"
+    "start": "node worker-completion.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"

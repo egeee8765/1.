@@ -8,16 +8,18 @@ export function runCompletionValidation(now=Date.now()) {
   const results=[];
   const test=(name,fn)=>{const started=Date.now();try{const evidence=fn();results.push({name,result:'PASS',durationMs:Date.now()-started,evidence:evidence||null});}catch(error){results.push({name,result:'FAIL',durationMs:Date.now()-started,error:error.message});}};
 
-  const base={snapshotTimestamp:now,balance:15,equity:15,availableMargin:15,positions:[],orders:[],stops:[]};
-  test('reconciliation-normal-match',()=>{assert(reconcileSnapshots(clone(base),clone(base)).pass,'normal mismatch');return {expected:'PASS'}});
-  for(const field of ['balance','equity','availableMargin']) test(`reconciliation-${field}-mismatch`,()=>{const x=clone(base);x[field]-=1;assert(!reconcileSnapshots(x,clone(base)).pass,'mismatch accepted');return {expected:'BLOCK'}});
-  test('reconciliation-position-mismatch',()=>{const x=clone(base);x.positions=[{symbol:'BTC_USDT',positionAmt:'1'}];assert(!reconcileSnapshots(x,clone(base)).pass,'position mismatch accepted');return {expected:'BLOCK'}});
-  test('reconciliation-size-mismatch',()=>{const x=clone(base);x.positions=[{symbol:'BTC_USDT',positionAmt:'1'}];const y=clone(base);y.positions=[{symbol:'BTC_USDT',positionAmt:'2'}];assert(!reconcileSnapshots(x,y).pass,'size mismatch accepted');return {expected:'BLOCK'}});
-  test('reconciliation-entry-mismatch',()=>{const x=clone(base);x.positions=[{symbol:'BTC_USDT',positionAmt:'1',avgPrice:'100'}];const y=clone(x);y.positions[0].avgPrice='101';assert(!reconcileSnapshots(x,y).pass,'entry mismatch accepted');return {expected:'BLOCK'}});
-  test('reconciliation-leverage-mismatch',()=>{const x=clone(base);x.positions=[{symbol:'BTC_USDT',leverage:'10'}];const y=clone(x);y.positions[0].leverage='11';assert(!reconcileSnapshots(x,y).pass,'leverage mismatch accepted');return {expected:'BLOCK'}});
-  test('reconciliation-open-order-mismatch',()=>{const x=clone(base);x.orders=[{orderId:'1'}];assert(!reconcileSnapshots(x,clone(base)).pass,'order mismatch accepted');return {expected:'BLOCK'}});
-  test('reconciliation-stop-order-mismatch',()=>{const x=clone(base);x.stops=[{stopId:'1'}];assert(!reconcileSnapshots(x,clone(base)).pass,'stop mismatch accepted');return {expected:'BLOCK'}});
-  test('reconciliation-staleness-mismatch',()=>{const x=clone(base);x.snapshotTimestamp+=SAFETY_LIMITS.reconciliationSkewMs+1;assert(!reconcileSnapshots(x,clone(base)).pass,'stale state accepted');return {expected:'BLOCK'}});
+  const exchangeBase={snapshotTimestamp:now,balance:15,equity:15,availableMargin:15,positions:[],orders:[],stops:[],source:'EXCHANGE_SNAPSHOT'};
+  const internalBase={snapshotTimestamp:now,balance:15,equity:15,availableMargin:15,positions:[],orders:[],stops:[],source:'INTERNAL_LEDGER'};
+  test('reconciliation-normal-match',()=>{assert(reconcileSnapshots(clone(exchangeBase),clone(internalBase)).pass,'normal mismatch');return {expected:'PASS',provenance:'INDEPENDENT_LEDGER'}});
+  for(const field of ['balance','equity','availableMargin']) test(`reconciliation-${field}-mismatch`,()=>{const x=clone(exchangeBase);x[field]-=1;assert(!reconcileSnapshots(x,clone(internalBase)).pass,'mismatch accepted');return {expected:'BLOCK'}});
+  test('reconciliation-position-mismatch',()=>{const x=clone(exchangeBase);x.positions=[{symbol:'BTC_USDT',positionAmt:'1'}];assert(!reconcileSnapshots(x,clone(internalBase)).pass,'position mismatch accepted');return {expected:'BLOCK'}});
+  test('reconciliation-size-mismatch',()=>{const x=clone(exchangeBase);x.positions=[{symbol:'BTC_USDT',positionAmt:'1'}];const y=clone(internalBase);y.positions=[{symbol:'BTC_USDT',positionAmt:'2'}];assert(!reconcileSnapshots(x,y).pass,'size mismatch accepted');return {expected:'BLOCK'}});
+  test('reconciliation-entry-mismatch',()=>{const x=clone(exchangeBase);x.positions=[{symbol:'BTC_USDT',positionAmt:'1',avgPrice:'100'}];const y=clone(internalBase);y.positions=[{symbol:'BTC_USDT',positionAmt:'1',avgPrice:'101'}];assert(!reconcileSnapshots(x,y).pass,'entry mismatch accepted');return {expected:'BLOCK'}});
+  test('reconciliation-leverage-mismatch',()=>{const x=clone(exchangeBase);x.positions=[{symbol:'BTC_USDT',leverage:'10'}];const y=clone(internalBase);y.positions=[{symbol:'BTC_USDT',leverage:'11'}];assert(!reconcileSnapshots(x,y).pass,'leverage mismatch accepted');return {expected:'BLOCK'}});
+  test('reconciliation-open-order-mismatch',()=>{const x=clone(exchangeBase);x.orders=[{orderId:'1'}];assert(!reconcileSnapshots(x,clone(internalBase)).pass,'order mismatch accepted');return {expected:'BLOCK'}});
+  test('reconciliation-stop-order-mismatch',()=>{const x=clone(exchangeBase);x.stops=[{stopId:'1'}];assert(!reconcileSnapshots(x,clone(internalBase)).pass,'stop mismatch accepted');return {expected:'BLOCK'}});
+  test('reconciliation-staleness-mismatch',()=>{const y=clone(internalBase);y.snapshotTimestamp+=SAFETY_LIMITS.reconciliationSkewMs+1;assert(!reconcileSnapshots(clone(exchangeBase),y).pass,'stale state accepted');return {expected:'BLOCK'}});
+  test('reconciliation-provenance-mismatch',()=>{assert(!reconcileSnapshots(clone(exchangeBase),clone(exchangeBase)).pass,'exchange-derived state accepted as internal');return {expected:'BLOCK'}});
 
   test('lease-acquisition-failure-blocks',()=>{assert(!executionAuthorityGate({leaseHeld:false,leaseValid:false,recoveryReady:true,reconciliationPass:true,heartbeatHealthy:true}).allowed,'lease failure allowed');return {expected:'BLOCK'}});
   test('lease-expiry-blocks',()=>{assert(!executionAuthorityGate({leaseHeld:true,leaseValid:false,recoveryReady:true,reconciliationPass:true,heartbeatHealthy:true}).allowed,'expired lease allowed');return {expected:'BLOCK'}});

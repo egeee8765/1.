@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node worker-hardened-v3.mjs"
+    "start": "node worker-hardened-v4.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"

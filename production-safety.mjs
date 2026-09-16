@@ -43,6 +43,8 @@ export function reconcileSnapshots(exchange, local, maxSkewMs = SAFETY_LIMITS.re
   const required = ['balance','equity','availableMargin','positions','orders','stops'];
   const missing = required.filter(k => exchange?.[k] === undefined || local?.[k] === undefined);
   if (missing.length) return { pass:false, reason:'INCOMPLETE_STATE', missing };
+  if (local?.source !== 'INTERNAL_LEDGER') return { pass:false, reason:'INDEPENDENT_INTERNAL_STATE_REQUIRED' };
+  if (exchange?.source === 'INTERNAL_LEDGER') return { pass:false, reason:'EXCHANGE_STATE_PROVENANCE_INVALID' };
   const exchangeTs = Number(exchange.snapshotTimestamp), localTs = Number(local.snapshotTimestamp);
   if (!Number.isFinite(exchangeTs) || !Number.isFinite(localTs) || Math.abs(exchangeTs-localTs) > maxSkewMs) return { pass:false, reason:'NON_ATOMIC_OR_STALE_SNAPSHOT', skewMs:Math.abs(exchangeTs-localTs) };
   const normalized = x => JSON.stringify({balance:x.balance,equity:x.equity,availableMargin:x.availableMargin,positions:x.positions||[],orders:x.orders||[],stops:x.stops||[]});
@@ -67,10 +69,12 @@ export function runProductionSafetyTests(now = Date.now()) {
   expect('stale-heartbeat-blocks',()=>assert(!executionAuthorityGate({leaseHeld:true,leaseValid:true,recoveryReady:true,reconciliationPass:true,heartbeatHealthy:false}).allowed,'heartbeat'));
   expect('clock-within-bound',()=>assert(validateClock(now,now+1000).pass,'clock'));
   expect('clock-drift-blocks',()=>assert(!validateClock(now,now+6000).pass,'clock drift'));
-  const base={snapshotTimestamp:now,balance:15,equity:15,availableMargin:15,positions:[],orders:[],stops:[]};
-  expect('reconciliation-match',()=>assert(reconcileSnapshots({...base}, {...base}).pass,'match'));
-  expect('reconciliation-mismatch',()=>assert(!reconcileSnapshots({...base,equity:14},{...base}).pass,'mismatch'));
-  expect('reconciliation-stale',()=>assert(!reconcileSnapshots({...base,snapshotTimestamp:now},{...base,snapshotTimestamp:now+3000}).pass,'stale'));
+  const base={snapshotTimestamp:now,balance:15,equity:15,availableMargin:15,positions:[],orders:[],stops:[],source:'EXCHANGE_SNAPSHOT'};
+  const internal={...base,source:'INTERNAL_LEDGER'};
+  expect('reconciliation-match-independent',()=>assert(reconcileSnapshots({...base},{...internal}).pass,'match'));
+  expect('reconciliation-provenance-blocks',()=>assert(!reconcileSnapshots({...base},{...base}).pass,'exchange-derived internal state accepted'));
+  expect('reconciliation-mismatch',()=>assert(!reconcileSnapshots({...base,equity:14},{...internal}).pass,'mismatch'));
+  expect('reconciliation-stale',()=>assert(!reconcileSnapshots({...base},{...internal,snapshotTimestamp:now+3000}).pass,'stale'));
   expect('lifecycle-order-intent-no-live',()=>{const steps=['SIGNAL','DATA','RISK','KILL_SWITCH','EXECUTION_AUTHORITY','ORDER_INTENT','ORDER_SUBMISSION_SIMULATION','ACK','PARTIAL_FILL','FULL_FILL','SL/TP_SIMULATION','POSITION_UPDATE','EXIT','RECONCILIATION'];assert(steps.length===14,'lifecycle')});
   expect('duplicate-execution-idempotency',()=>{const ids=new Set(['intent-1']);assert(!ids.has('intent-2'),'idempotency')});
   expect('exchange-rejection-fail-closed',()=>assert(!executionAuthorityGate({leaseHeld:true,leaseValid:true,recoveryReady:true,reconciliationPass:false,heartbeatHealthy:true}).allowed,'rejection'));
